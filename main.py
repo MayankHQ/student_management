@@ -1,5 +1,6 @@
 from fastapi import FastAPI, Depends, HTTPException
 from sqlalchemy.orm import Session
+from sqlalchemy import desc
 
 import models
 import schemas
@@ -8,12 +9,15 @@ from security import hash_password, verify_password
 from jwt_utils import create_access_token, verify_access_token
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
+from models import User, Student, Marks, UserRole
 
-# create tables
+
+# ---------------- Create Tables ----------------
 models.Base.metadata.create_all(bind=engine)
 
 app = FastAPI()
 security = HTTPBearer()
+
 
 # ---------------- DB Dependency ----------------
 def get_db():
@@ -23,145 +27,220 @@ def get_db():
     finally:
         db.close()
 
-#Takes token from header -> Verifies signature + expiry -> Extracts username -> Loads user from DB -> Returns user object -> Blocks request if anything fails
 
+# ---------------- Auth Dependency ----------------
 def get_current_user(
     credentials: HTTPAuthorizationCredentials = Depends(security),
     db: Session = Depends(get_db)
 ):
-    token = credentials.credentials
-    payload = verify_access_token(token)
-
-    if payload is None:
-        raise HTTPException(status_code=401, detail="Invalid or expired token")
+    payload = verify_access_token(credentials.credentials)
+    if not payload:
+        raise HTTPException(status_code=401, detail="Invalid token")
 
     username = payload.get("sub")
-    if username is None:
-        raise HTTPException(status_code=401, detail="Invalid token payload")
+    user = db.query(User).filter(User.username == username).first()
 
-    user = db.query(models.User).filter(
-        models.User.username == username
-    ).first()
-
-    if user is None:
+    if not user:
         raise HTTPException(status_code=401, detail="User not found")
 
     return user
 
 
-
 # ---------------- Root ----------------
 @app.get("/")
-def greet():
-    return "Welcome to the Python application!"
+def root():
+    return "Student Management System API"
 
 
 # ---------------- Register ----------------
 @app.post("/register")
-def register(user: schemas.UserCreate, db: Session = Depends(get_db)):
-    existing_user = db.query(models.User).filter(
-        models.User.username == user.username
-    ).first()
-
-    if existing_user:
+def register(user: schemas.UserRegister, db: Session = Depends(get_db)):
+    if db.query(User).filter(User.username == user.username).first():
         raise HTTPException(status_code=400, detail="Username already exists")
 
-    hashed_pw = hash_password(user.password)
-
-    new_user = models.User(
+    new_user = User(
         username=user.username,
-        password=hashed_pw
+        password=hash_password(user.password),
+        role=user.role.value
     )
 
     db.add(new_user)
     db.commit()
 
-    return {"message": "User registered successfully"}
+    return {"message": f"{user.role.value.capitalize()} registered successfully"}
+
 
 # ---------------- Login ----------------
 @app.post("/login", response_model=schemas.Token)
 def login(user: schemas.UserLogin, db: Session = Depends(get_db)):
-    # 1. Find user
-    db_user = db.query(models.User).filter(
-        models.User.username == user.username
-    ).first()
+    db_user = db.query(User).filter(User.username == user.username).first()
 
-    # 2. If user not found
-    if not db_user:
-        raise HTTPException(
-            status_code=401,
-            detail="Invalid username or password"
-        )
+    if not db_user or not verify_password(user.password, db_user.password):
+        raise HTTPException(status_code=401, detail="Invalid credentials")
 
-    # 3. Verify password
-    if not verify_password(user.password, db_user.password):
-        raise HTTPException(
-            status_code=401,
-            detail="Invalid username or password"
-        )
-    
-    access_token = create_access_token(
-        data={"sub": db_user.username}
+    token = create_access_token(
+        data={"sub": db_user.username, "role": db_user.role}
     )
 
+    return {"access_token": token, "token_type": "bearer"}
+
+
+# ---------------- Me ----------------
+@app.get("/me")
+def me(current_user: User = Depends(get_current_user)):
     return {
-        "access_token": access_token,
-        "token_type": "bearer"
+        "username": current_user.username,
+        "role": current_user.role
     }
 
-    # # 4. Login success (NO JWT YET)
-    # return {"message": "Login successful"}
-
-
-# ---------------- Products CRUD ----------------
-@app.get("/products")
-def list_products(
+# ---------------- Student: View Profile ----------------
+@app.get("/students/me")
+def student_profile(
     db: Session = Depends(get_db),
-    current_user: models.User = Depends(get_current_user)
+    current_user: User = Depends(get_current_user)
 ):
-    return db.query(models.Product).all()
+    if current_user.role != UserRole.STUDENT.value:
+        raise HTTPException(status_code=403, detail="Only students allowed")
 
+    student = db.query(Student).filter(
+        Student.user_id == current_user.id
+    ).first()
 
+    if not student:
+        raise HTTPException(status_code=404, detail="Profile not created yet")
 
-@app.get("/products/{product_id}")
-def get_product_by_id(product_id: int, db: Session = Depends(get_db)):
-    product = db.query(models.Product).filter(models.Product.id == product_id).first()
-    if not product:
-        raise HTTPException(status_code=404, detail="Product not found")
-    return product
+    return {
+        "username": current_user.username,
+        "roll_no": student.roll_no
+    }
 
+# ---------------- Teacher: Assign Roll + Marks (ONE STEP) ----------------
+@app.post("/marks")
+def assign_marks(
+    data: schemas.AssignMarks,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    if current_user.role != UserRole.TEACHER.value:
+        raise HTTPException(status_code=403, detail="Only teachers allowed")
 
-@app.post("/products")
-def add_product(product: schemas.Product, db: Session = Depends(get_db)):
-    db_product = models.Product(**product.model_dump())
-    db.add(db_product)
+    # 1. ensure student profile exists
+    student = db.query(Student).filter(
+        Student.user_id == data.user_id
+    ).first()
+
+    if not student:
+        student = Student(
+            user_id=data.user_id,
+            roll_no=data.roll_no
+        )
+        db.add(student)
+        db.flush()
+    else:
+        student.roll_no = data.roll_no  # allow update
+
+    # 2. save/update marks
+    marks = db.query(Marks).filter(
+        Marks.student_id == student.id
+    ).first()
+
+    if not marks:
+        marks = Marks(
+            student_id=student.id,
+            s1=data.s1,
+            s2=data.s2,
+            s3=data.s3,
+            s4=data.s4,
+            s5=data.s5
+        )
+        db.add(marks)
+    else:
+        marks.s1 = data.s1
+        marks.s2 = data.s2
+        marks.s3 = data.s3
+        marks.s4 = data.s4
+        marks.s5 = data.s5
+
     db.commit()
-    return product
+    return {"message": "Roll number and marks saved successfully"}
 
 
-@app.put("/products/{product_id}")
-def update_product(product_id: int, product: schemas.Product, db: Session = Depends(get_db)):
-    db_product = db.query(models.Product).filter(models.Product.id == product_id).first()
+# ---------------- Student: View Own Marks ----------------
+@app.get("/students/marks", response_model=schemas.StudentMarksOut)
+def view_my_marks(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    if current_user.role != UserRole.STUDENT.value:
+        raise HTTPException(status_code=403, detail="Only students allowed")
 
-    if not db_product:
-        raise HTTPException(status_code=404, detail="Product not found")
+    student = db.query(Student).filter(
+        Student.user_id == current_user.id
+    ).first()
 
-    db_product.name = product.name
-    db_product.price = product.price
-    db_product.description = product.description
-    db.commit()
+    if not student or not student.marks:
+        raise HTTPException(status_code=404, detail="Marks not assigned yet")
 
-    return {"message": "Product updated successfully"}
+    m = student.marks
+    total = m.s1 + m.s2 + m.s3 + m.s4 + m.s5
+
+    return {
+        "s1": m.s1,
+        "s2": m.s2,
+        "s3": m.s3,
+        "s4": m.s4,
+        "s5": m.s5,
+        "total": total
+    }
 
 
-@app.delete("/products/{product_id}")
-def delete_product(product_id: int, db: Session = Depends(get_db)):
-    db_product = db.query(models.Product).filter(models.Product.id == product_id).first()
+# ---------------- Leaderboard ----------------
+@app.get("/leaderboard", response_model=list[schemas.LeaderboardOut])
+def leaderboard(
+    db: Session = Depends(get_db),
+    _: User = Depends(get_current_user)
+):
+    results = (
+        db.query(
+            Student.roll_no,
+            User.username,
+            Marks.s1,
+            Marks.s2,
+            Marks.s3,
+            Marks.s4,
+            Marks.s5
+        )
+        .join(User, User.id == Student.user_id)
+        .join(Marks, Marks.student_id == Student.id)
+        .all()
+    )
 
-    if not db_product:
-        raise HTTPException(status_code=404, detail="Product not found")
+    leaderboard = []
+    for r in results:
+        total = r.s1 + r.s2 + r.s3 + r.s4 + r.s5
+        leaderboard.append({
+            "roll_no": r.roll_no,
+            "student": r.username,
+            "total": total
+        })
 
-    db.delete(db_product)
-    db.commit()
+    leaderboard.sort(key=lambda x: x["total"], reverse=True)
 
-    return {"message": "Product deleted successfully"}
+    for idx, entry in enumerate(leaderboard, start=1):
+        entry["rank"] = idx
+
+    return leaderboard
+
+
+# ---------------- Teacher: List Student Users ----------------
+@app.get("/students/users")
+def list_student_users(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    if current_user.role != UserRole.TEACHER.value:
+        raise HTTPException(status_code=403, detail="Only teachers allowed")
+
+    return db.query(User).filter(
+        User.role == UserRole.STUDENT.value
+    ).all()
